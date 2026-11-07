@@ -202,10 +202,10 @@ app.post('/send/text', async (req, res) => {
   }
 });
 
-// 7. Send PDF catalogue document
-app.post('/send/document', async (req, res) => {
+// 7. Send photos as real WhatsApp images (opens directly in chat)
+app.post('/send/image', async (req, res) => {
   try {
-    const { sessionId, to, filename, caption, base64 } = req.body || {};
+    const { sessionId, to, caption, base64, mimetype } = req.body || {};
     if (!to || !base64) return res.status(400).json({ error: 'to and base64 are required' });
     const id = safeId(sessionId);
     const session = sessions.get(id);
@@ -214,11 +214,33 @@ app.post('/send/document', async (req, res) => {
     }
     const cleanTo = String(to).replace(/\D/g, '');
     const jid = `${cleanTo}@s.whatsapp.net`;
-    const buffer = Buffer.from(base64, 'base64');
     const sent = await session.sock.sendMessage(jid, {
-      document: buffer,
-      mimetype: 'application/pdf',
-      fileName: filename || 'catalogue.pdf',
+      image: Buffer.from(base64, 'base64'),
+      mimetype: mimetype || 'image/jpeg',
+      caption: caption ? String(caption).slice(0, 1020) : undefined
+    });
+    res.json({ messageId: sent?.key?.id || null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 8. Send files & catalogues (PDF, Word, Excel...) with their real filename and type
+app.post('/send/document', async (req, res) => {
+  try {
+    const { sessionId, to, filename, caption, base64, mimetype } = req.body || {};
+    if (!to || !base64) return res.status(400).json({ error: 'to and base64 are required' });
+    const id = safeId(sessionId);
+    const session = sessions.get(id);
+    if (!session || session.status !== 'connected' || !session.sock) {
+      return res.status(409).json({ error: 'WhatsApp session not connected. Scan the QR code.' });
+    }
+    const cleanTo = String(to).replace(/\D/g, '');
+    const jid = `${cleanTo}@s.whatsapp.net`;
+    const sent = await session.sock.sendMessage(jid, {
+      document: Buffer.from(base64, 'base64'),
+      mimetype: mimetype || 'application/pdf',
+      fileName: filename || 'file.pdf',
       caption: caption ? String(caption).slice(0, 1020) : undefined
     });
     res.json({ messageId: sent?.key?.id || null });
