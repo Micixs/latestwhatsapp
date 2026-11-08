@@ -1,264 +1,244 @@
-const express = require('express');
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
+/**
+ * B2BKAR WhatsApp link service (QR login).
+ *
+ * Runs OUTSIDE the B2BKAR app, on any always-on Node host (VPS, Render,
+ * Railway, Fly.io). It keeps a WhatsApp Web session alive per company and
+ * exposes a tiny HTTP API that B2BKAR calls to show the QR and send messages.
+ *
+ * Start:  BRIDGE_TOKEN=your-long-secret node server.js
+ */
+import express from "express";
+import QRCode from "qrcode";
+import {
+  default as makeWASocket,
   DisconnectReason,
+  useMultiFileAuthState,
   fetchLatestBaileysVersion,
-  Browsers
-} = require('@whiskeysockets/baileys');
-const pino = require('pino');
-const QRCode = require('qrcode');
-const fs = require('fs');
-const path = require('path');
+  Browsers,
+} from "@whiskeysockets/baileys";
+import { Boom } from "@hapi/boom";
+import fs from "node:fs";
+import path from "node:path";
 
-const app = express();
-app.use(express.json({ limit: '50mb' }));
-
-// Accepts either BRIDGE_TOKEN or WA_BRIDGE_TOKEN, and automatically trims spaces
-const BRIDGE_TOKEN = (process.env.BRIDGE_TOKEN || process.env.WA_BRIDGE_TOKEN || '').trim();
-const PORT = process.env.PORT || 10000;
-const DATA_DIR = path.join(__dirname, 'sessions');
-
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+const PORT = process.env.PORT || 8081;
+const TOKEN = process.env.BRIDGE_TOKEN;
+const DATA_DIR = process.env.DATA_DIR || "./sessions";
+if (!TOKEN || TOKEN.length < 16) {
+  console.error("Set BRIDGE_TOKEN to a long random secret before starting.");
+  process.exit(1);
 }
+fs.mkdirSync(DATA_DIR, { recursive: true });
 
+/** sessionId -> { sock, status, qr, phone } */
 const sessions = new Map();
 
-function safeId(rawId) {
-  return String(rawId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+function safeId(id) {
+  return String(id).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64);
 }
 
-// 1. Public Health Check
-app.get('/health', (req, res) => {
-  res.json({
-    ok: true,
-    status: 'online',
-    hasTokenConfigured: !!BRIDGE_TOKEN,
-    timestamp: new Date().toISOString()
-  });
-});
-
-// Authentication middleware (protects all WhatsApp endpoints)
-app.use((req, res, next) => {
-  const incoming = (
-    req.headers['x-bridge-token'] || 
-    req.headers['authorization'] || 
-    ''
-  ).replace(/^Bearer\s+/i, '').trim();
-
-  if (!BRIDGE_TOKEN) {
-    return res.status(500).json({ error: 'Server misconfiguration: BRIDGE_TOKEN is not set in Render environment.' });
-  }
-  if (!incoming || incoming !== BRIDGE_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized: invalid x-bridge-token' });
-  }
-  next();
-});
-
-async function getOrCreateSession(rawId) {
+async function startSession(rawId) {
   const id = safeId(rawId);
-  if (!id) throw new Error('sessionId is required');
-
   const existing = sessions.get(id);
-  if (existing && (existing.status === 'connected' || existing.status === 'qr')) {
-    return existing;
-  }
+  if (existing && (existing.status === "connected" || existing.status === "qr")) return existing;
 
   const dir = path.join(DATA_DIR, id);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-
+  fs.mkdirSync(dir, { recursive: true });
   const { state, saveCreds } = await useMultiFileAuthState(dir);
   const { version } = await fetchLatestBaileysVersion();
 
-  const entry = existing || { status: 'connecting', qr: null, phone: null, sock: null };
+  const entry = existing ?? { status: "connecting", qr: null, phone: null };
   sessions.set(id, entry);
 
-  // Initialized with WhatsApp Business optimizations
+  // Desktop browser identity + no full history sync helps WhatsApp Business link reliably.
   const sock = makeWASocket({
     version,
     auth: state,
-    logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
-    // Identifies as standard Desktop browser to avoid WhatsApp Business bot detection
-    browser: Browsers.macOS('Desktop'),
-    // Disables full catalog & message history sync to prevent timeouts on business accounts
+    // WhatsApp Business rejects/hangs on the "Desktop" identity; a web browser identity links reliably.
+    browser: Browsers.ubuntu("Chrome"),
     syncFullHistory: false,
+    generateHighQualityLinkPreview: false,
+    getMessage: async () => undefined,
     markOnlineOnConnect: false,
-    connectTimeoutMs: 60000,
-    defaultQueryTimeoutMs: 60000,
-    keepAliveIntervalMs: 25000,
+    connectTimeoutMs: 60_000,
+    defaultQueryTimeoutMs: 60_000,
+    keepAliveIntervalMs: 25_000,
   });
   entry.sock = sock;
 
-  sock.ev.on('creds.update', saveCreds);
-
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    if (qr) {
-      entry.status = 'qr';
-      try {
-        entry.qr = await QRCode.toDataURL(qr, { margin: 1, width: 320 });
-      } catch (err) {
-        console.error('QR code generation error:', err);
-      }
+  sock.ev.on("creds.update", saveCreds);
+  sock.ev.on("connection.update", async (u) => {
+    if (u.qr) {
+      entry.qr = await QRCode.toDataURL(u.qr, { margin: 1, width: 320 });
+      entry.status = "qr";
     }
-    if (connection === 'open') {
-      entry.status = 'connected';
+    if (u.connection === "open") {
+      entry.status = "connected";
       entry.qr = null;
-      entry.phone = sock.user?.id?.split(':')[0] || null;
+      entry.phone = sock.user?.id?.split(":")[0] ?? null;
     }
-    if (connection === 'close') {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      entry.status = 'disconnected';
+    if (u.connection === "close") {
+      const code = new Boom(u.lastDisconnect?.error)?.output?.statusCode;
+      entry.status = "disconnected";
       entry.sock = null;
-      entry.qr = null;
-      if (shouldReconnect) {
-        setTimeout(() => getOrCreateSession(id).catch(() => {}), 3000);
-      } else {
-        sessions.delete(id);
-        fs.rmSync(dir, { recursive: true, force: true });
-      }
+      if (code !== DisconnectReason.loggedOut) setTimeout(() => startSession(id), 3000);
+      else fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  // Wait a short moment to capture immediate QR if ready
-  for (let i = 0; i < 20 && entry.status === 'connecting'; i++) {
+  // Give WhatsApp a moment to emit the first QR so the caller gets it inline.
+  for (let i = 0; i < 25 && entry.status === "connecting"; i++) {
     await new Promise((r) => setTimeout(r, 200));
   }
-
   return entry;
 }
 
-// 2. Start session (generates QR code)
-app.post('/session/start', async (req, res) => {
-  try {
-    const session = await getOrCreateSession(req.body?.sessionId);
-    res.json({ status: session.status, qr: session.qr, phone: session.phone });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+async function resetSession(id) {
+  const e = sessions.get(id);
+  if (e?.sock) {
+    try {
+      e.sock.ev.removeAllListeners("connection.update");
+      e.sock.end(undefined);
+    } catch {
+      /* ignore */
+    }
   }
+  sessions.delete(id);
+  fs.rmSync(path.join(DATA_DIR, id), { recursive: true, force: true });
+}
+
+function jid(to) {
+  const digits = String(to).replace(/\D/g, "");
+  return `${digits}@s.whatsapp.net`;
+}
+
+function requireSession(id) {
+  const entry = sessions.get(safeId(id));
+  if (!entry?.sock || entry.status !== "connected") {
+    const err = new Error("WhatsApp is not linked. Scan the QR code again.");
+    err.status = 409;
+    throw err;
+  }
+  return entry;
+}
+
+const app = express();
+app.use(express.json({ limit: "25mb" }));
+app.use((req, res, next) => {
+  if (req.path === "/health") return next();
+  if (req.get("x-bridge-token") !== TOKEN) return res.status(401).json({ error: "Unauthorized" });
+  next();
 });
 
-// 3. Status of session
-app.get('/session/status', async (req, res) => {
-  try {
-    const id = safeId(req.query.sessionId);
-    let session = sessions.get(id);
-    if (!session) {
-      session = await getOrCreateSession(id);
-    }
-    res.json({ status: session.status, qr: session.qr, phone: session.phone });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// 4. Request 8-digit phone pairing code
-app.post('/session/pair', async (req, res) => {
-  try {
-    const phone = String(req.body?.phone || '').replace(/\D/g, '');
-    if (phone.length < 10) {
-      return res.status(400).json({ error: 'Valid phone number required' });
-    }
-    const session = await getOrCreateSession(req.body?.sessionId);
-    if (session.status === 'connected') {
-      return res.json({ code: null, status: 'connected' });
-    }
-    if (!session.sock) {
-      return res.status(500).json({ error: 'Socket not initialized' });
-    }
-    const code = await session.sock.requestPairingCode(phone);
-    res.json({ code });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// 5. Logout session
-app.post('/session/logout', async (req, res) => {
+app.post("/session/start", async (req, res, next) => {
   try {
     const id = safeId(req.body?.sessionId);
-    const session = sessions.get(id);
-    if (session?.sock) {
-      try { await session.sock.logout(); } catch (_) {}
+    const current = sessions.get(id);
+    // Not linked yet: wipe any half-finished keys so each QR is a clean handshake.
+    if (current?.status !== "connected" && (req.body?.fresh ?? true)) await resetSession(id);
+    const e = await startSession(id);
+    res.json({ status: e.status, qr: e.qr, phone: e.phone });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/session/pair", async (req, res, next) => {
+  try {
+    const phone = String(req.body?.phone ?? "").replace(/\D/g, "");
+    if (phone.length < 10) return res.status(400).json({ error: "Valid phone number required" });
+    const id = safeId(req.body?.sessionId);
+    const current = sessions.get(id);
+    if (current?.status === "connected") return res.json({ code: null, status: "connected" });
+    // Fresh, clean session for phone-code pairing: stale keys from a failed QR scan cause "wrong code".
+    await resetSession(id);
+    const e = await startSession(id);
+    if (!e.sock) return res.status(503).json({ error: "Link service is starting, try again" });
+    await new Promise((r) => setTimeout(r, 2500));
+    const code = await e.sock.requestPairingCode(phone);
+    res.json({ code });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get("/session/status", async (req, res, next) => {
+  try {
+    const id = safeId(req.query.sessionId);
+    let e = sessions.get(id);
+    if (!e) e = await startSession(id);
+    res.json({ status: e.status, qr: e.qr, phone: e.phone });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/session/logout", async (req, res, next) => {
+  try {
+    const id = safeId(req.body?.sessionId);
+    const e = sessions.get(id);
+    try {
+      await e?.sock?.logout();
+    } catch {
+      /* already gone */
     }
     sessions.delete(id);
-    const dir = path.join(DATA_DIR, id);
-    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(path.join(DATA_DIR, id), { recursive: true, force: true });
     res.json({ ok: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
-// 6. Direct WhatsApp message sending
-app.post('/send/text', async (req, res) => {
+app.post("/send/text", async (req, res, next) => {
   try {
-    const { sessionId, to, text } = req.body || {};
-    if (!to || !text) return res.status(400).json({ error: 'to and text are required' });
-    const id = safeId(sessionId);
-    const session = sessions.get(id);
-    if (!session || session.status !== 'connected' || !session.sock) {
-      return res.status(409).json({ error: 'WhatsApp session not connected. Scan the QR code.' });
-    }
-    const cleanTo = String(to).replace(/\D/g, '');
-    const jid = `${cleanTo}@s.whatsapp.net`;
-    const sent = await session.sock.sendMessage(jid, { text: String(text).slice(0, 4000) });
-    res.json({ messageId: sent?.key?.id || null });
+    const { sessionId, to, text } = req.body ?? {};
+    if (!to || !text) return res.status(400).json({ error: "to and text are required" });
+    const e = requireSession(sessionId);
+    const sent = await e.sock.sendMessage(jid(to), { text: String(text).slice(0, 4000) });
+    res.json({ messageId: sent?.key?.id ?? null });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
-// 7. Send photos as real WhatsApp images (opens directly in chat)
-app.post('/send/image', async (req, res) => {
+app.post("/send/image", async (req, res, next) => {
   try {
-    const { sessionId, to, caption, base64, mimetype } = req.body || {};
-    if (!to || !base64) return res.status(400).json({ error: 'to and base64 are required' });
-    const id = safeId(sessionId);
-    const session = sessions.get(id);
-    if (!session || session.status !== 'connected' || !session.sock) {
-      return res.status(409).json({ error: 'WhatsApp session not connected. Scan the QR code.' });
-    }
-    const cleanTo = String(to).replace(/\D/g, '');
-    const jid = `${cleanTo}@s.whatsapp.net`;
-    const sent = await session.sock.sendMessage(jid, {
-      image: Buffer.from(base64, 'base64'),
-      mimetype: mimetype || 'image/jpeg',
-      caption: caption ? String(caption).slice(0, 1020) : undefined
+    const { sessionId, to, caption, base64, mimetype } = req.body ?? {};
+    if (!to || !base64) return res.status(400).json({ error: "to and base64 are required" });
+    const e = requireSession(sessionId);
+    const sent = await e.sock.sendMessage(jid(to), {
+      image: Buffer.from(base64, "base64"),
+      mimetype: mimetype || "image/jpeg",
+      caption: caption ? String(caption).slice(0, 1020) : undefined,
     });
-    res.json({ messageId: sent?.key?.id || null });
+    res.json({ messageId: sent?.key?.id ?? null });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
-// 8. Send files & catalogues (PDF, Word, Excel...) with real filename and type
-app.post('/send/document', async (req, res) => {
+app.post("/send/document", async (req, res, next) => {
   try {
-    const { sessionId, to, filename, caption, base64, mimetype } = req.body || {};
-    if (!to || !base64) return res.status(400).json({ error: 'to and base64 are required' });
-    const id = safeId(sessionId);
-    const session = sessions.get(id);
-    if (!session || session.status !== 'connected' || !session.sock) {
-      return res.status(409).json({ error: 'WhatsApp session not connected. Scan the QR code.' });
-    }
-    const cleanTo = String(to).replace(/\D/g, '');
-    const jid = `${cleanTo}@s.whatsapp.net`;
-    const sent = await session.sock.sendMessage(jid, {
-      document: Buffer.from(base64, 'base64'),
-      mimetype: mimetype || 'application/pdf',
-      fileName: filename || 'file.pdf',
-      caption: caption ? String(caption).slice(0, 1020) : undefined
+    const { sessionId, to, filename, caption, base64, mimetype } = req.body ?? {};
+    if (!to || !base64) return res.status(400).json({ error: "to and base64 are required" });
+    const e = requireSession(sessionId);
+    const sent = await e.sock.sendMessage(jid(to), {
+      document: Buffer.from(base64, "base64"),
+      mimetype: mimetype || "application/pdf",
+      fileName: filename || "catalogue.pdf",
+      caption: caption ? String(caption).slice(0, 1020) : undefined,
     });
-    res.json({ messageId: sent?.key?.id || null });
+    res.json({ messageId: sent?.key?.id ?? null });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`B2BKAR Baileys Bridge listening on port ${PORT}`);
+app.use((err, _req, res, _next) => {
+  res.status(err.status || 500).json({ error: err.message || "Bridge error" });
 });
+
+app.listen(PORT, () => console.log(`WhatsApp link service listening on :${PORT}`));
