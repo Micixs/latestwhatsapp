@@ -20,6 +20,7 @@ const DisconnectReason = b.DisconnectReason || baileysPkg.DisconnectReason;
 const useMultiFileAuthState = b.useMultiFileAuthState || baileysPkg.useMultiFileAuthState;
 const fetchLatestBaileysVersion = b.fetchLatestBaileysVersion || baileysPkg.fetchLatestBaileysVersion;
 const Browsers = b.Browsers || baileysPkg.Browsers;
+const makeCacheableSignalKeyStore = b.makeCacheableSignalKeyStore || baileysPkg.makeCacheableSignalKeyStore;
 
 const PORT = process.env.PORT || 8081;
 const TOKEN = process.env.BRIDGE_TOKEN;
@@ -50,17 +51,18 @@ async function startSession(rawId) {
   const entry = existing ?? { status: "connecting", qr: null, phone: null };
   sessions.set(id, entry);
 
-  // Desktop browser identity + no full history sync helps WhatsApp Business link reliably.
   const sock = makeWASocket({
     version,
-    auth: state,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore ? makeCacheableSignalKeyStore(state.keys) : state.keys,
+    },
     printQRInTerminal: false,
-    // WhatsApp Business rejects/hangs on the "Desktop" identity; Chrome browser identity links reliably.
-    browser: Browsers.ubuntu("Chrome"),
+    browser: Browsers.macOS("Chrome"),
     syncFullHistory: false,
     generateHighQualityLinkPreview: false,
     getMessage: async () => undefined,
-    markOnlineOnConnect: false,
+    markOnlineOnConnect: true,
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: 60_000,
     keepAliveIntervalMs: 25_000,
@@ -87,7 +89,6 @@ async function startSession(rawId) {
     }
   });
 
-  // Give WhatsApp a moment to emit the first QR so the caller gets it inline.
   for (let i = 0; i < 25 && entry.status === "connecting"; i++) {
     await new Promise((r) => setTimeout(r, 200));
   }
@@ -137,7 +138,6 @@ app.post("/session/start", async (req, res, next) => {
   try {
     const id = safeId(req.body?.sessionId);
     const current = sessions.get(id);
-    // Not linked yet: wipe any half-finished keys so each QR is a clean handshake.
     if (current?.status !== "connected" && (req.body?.fresh ?? true)) await resetSession(id);
     const e = await startSession(id);
     res.json({ status: e.status, qr: e.qr, phone: e.phone });
@@ -153,7 +153,6 @@ app.post("/session/pair", async (req, res, next) => {
     const id = safeId(req.body?.sessionId);
     const current = sessions.get(id);
     if (current?.status === "connected") return res.json({ code: null, status: "connected" });
-    // Fresh, clean session for phone-code pairing: stale keys from a failed QR scan cause "wrong code".
     await resetSession(id);
     const e = await startSession(id);
     if (!e.sock) return res.status(503).json({ error: "Link service is starting, try again" });
