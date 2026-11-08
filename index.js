@@ -1,26 +1,21 @@
 /**
  * B2BKAR WhatsApp link service (QR login).
  *
- * Runs OUTSIDE the B2BKAR app, on any always-on Node host (VPS, Render,
- * Railway, Fly.io). It keeps a WhatsApp Web session alive per company and
- * exposes a tiny HTTP API that B2BKAR calls to show the QR and send messages.
- *
- * Start:  BRIDGE_TOKEN=your-long-secret node server.js
+ * Runs OUTSIDE the B2BKAR app on Render/Railway/VPS.
+ * Keeps WhatsApp Web sessions alive and exposes HTTP endpoints for QR and sending.
  */
 import express from "express";
 import QRCode from "qrcode";
-import * as baileysPkg from "@whiskeysockets/baileys";
+import {
+  default as makeWASocket,
+  DisconnectReason,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  Browsers,
+} from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import fs from "node:fs";
 import path from "node:path";
-
-const b = baileysPkg.default && typeof baileysPkg.default === "object" ? baileysPkg.default : baileysPkg;
-const makeWASocket = typeof b.default === "function" ? b.default : (typeof b.makeWASocket === "function" ? b.makeWASocket : baileysPkg.makeWASocket);
-const DisconnectReason = b.DisconnectReason || baileysPkg.DisconnectReason;
-const useMultiFileAuthState = b.useMultiFileAuthState || baileysPkg.useMultiFileAuthState;
-const fetchLatestBaileysVersion = b.fetchLatestBaileysVersion || baileysPkg.fetchLatestBaileysVersion;
-const Browsers = b.Browsers || baileysPkg.Browsers;
-const makeCacheableSignalKeyStore = b.makeCacheableSignalKeyStore || baileysPkg.makeCacheableSignalKeyStore;
 
 const PORT = process.env.PORT || 8081;
 const TOKEN = process.env.BRIDGE_TOKEN;
@@ -41,7 +36,7 @@ function safeId(id) {
 async function startSession(rawId) {
   const id = safeId(rawId);
   const existing = sessions.get(id);
-  if (existing && (existing.status === "connected" || existing.status === "qr")) return existing;
+  if (existing && existing.sock && ["connected", "qr", "connecting"].includes(existing.status)) return existing;
 
   const dir = path.join(DATA_DIR, id);
   fs.mkdirSync(dir, { recursive: true });
@@ -51,18 +46,16 @@ async function startSession(rawId) {
   const entry = existing ?? { status: "connecting", qr: null, phone: null };
   sessions.set(id, entry);
 
+  // Desktop Chrome identity + no full history sync links reliably with WhatsApp Business
   const sock = makeWASocket({
     version,
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore ? makeCacheableSignalKeyStore(state.keys) : state.keys,
-    },
+    auth: state,
     printQRInTerminal: false,
-    browser: Browsers.macOS("Chrome"),
+    browser: Browsers.ubuntu("Chrome"),
     syncFullHistory: false,
     generateHighQualityLinkPreview: false,
     getMessage: async () => undefined,
-    markOnlineOnConnect: true,
+    markOnlineOnConnect: false,
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: 60_000,
     keepAliveIntervalMs: 25_000,
@@ -80,15 +73,28 @@ async function startSession(rawId) {
       entry.qr = null;
       entry.phone = sock.user?.id?.split(":")[0] ?? null;
     }
+    if (u.connection) console.log(`[${id}] connection=${u.connection}`);
     if (u.connection === "close") {
       const code = new Boom(u.lastDisconnect?.error)?.output?.statusCode;
-      entry.status = "disconnected";
+      console.log(`[${id}] closed code=${code}`);
       entry.sock = null;
-      if (code !== DisconnectReason.loggedOut) setTimeout(() => startSession(id), 3000);
-      else fs.rmSync(dir, { recursive: true, force: true });
+      if (code === DisconnectReason.loggedOut) {
+        entry.status = "disconnected";
+        entry.qr = null;
+        fs.rmSync(dir, { recursive: true, force: true });
+      } else if (code === DisconnectReason.restartRequired) {
+        // Normal right after a QR scan: keys are saved, reconnect immediately — never wipe them
+        entry.status = "connecting";
+        entry.qr = null;
+        startSession(id).catch((e) => console.error(`[${id}] restart failed`, e));
+      } else {
+        entry.status = entry.status === "connected" ? "connecting" : "disconnected";
+        setTimeout(() => startSession(id).catch(() => {}), 3000);
+      }
     }
   });
 
+  // Give WhatsApp a moment to emit the first QR so the caller gets it inline
   for (let i = 0; i < 25 && entry.status === "connecting"; i++) {
     await new Promise((r) => setTimeout(r, 200));
   }
@@ -138,7 +144,16 @@ app.post("/session/start", async (req, res, next) => {
   try {
     const id = safeId(req.body?.sessionId);
     const current = sessions.get(id);
-    if (current?.status !== "connected" && (req.body?.fresh ?? true)) await resetSession(id);
+    const credsFile = path.join(DATA_DIR, id, "creds.json");
+    let registered = false;
+    try {
+      const data = JSON.parse(fs.readFileSync(credsFile, "utf8"));
+      registered = data?.registered === true || !!data?.me;
+    } catch {
+      /* no creds yet */
+    }
+    const busy = current?.status === "connected" || current?.status === "connecting" || registered;
+    if (!busy && (req.body?.fresh ?? true)) await resetSession(id);
     const e = await startSession(id);
     res.json({ status: e.status, qr: e.qr, phone: e.phone });
   } catch (err) {
