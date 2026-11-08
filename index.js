@@ -9,16 +9,17 @@
  */
 import express from "express";
 import QRCode from "qrcode";
-import {
-  default as makeWASocket,
-  DisconnectReason,
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  Browsers,
-} from "@whiskeysockets/baileys";
+import * as baileysPkg from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import fs from "node:fs";
 import path from "node:path";
+
+const b = baileysPkg.default && typeof baileysPkg.default === "object" ? baileysPkg.default : baileysPkg;
+const makeWASocket = typeof b.default === "function" ? b.default : (typeof b.makeWASocket === "function" ? b.makeWASocket : baileysPkg.makeWASocket);
+const DisconnectReason = b.DisconnectReason || baileysPkg.DisconnectReason;
+const useMultiFileAuthState = b.useMultiFileAuthState || baileysPkg.useMultiFileAuthState;
+const fetchLatestBaileysVersion = b.fetchLatestBaileysVersion || baileysPkg.fetchLatestBaileysVersion;
+const Browsers = b.Browsers || baileysPkg.Browsers;
 
 const PORT = process.env.PORT || 8081;
 const TOKEN = process.env.BRIDGE_TOKEN;
@@ -54,7 +55,7 @@ async function startSession(rawId) {
     version,
     auth: state,
     printQRInTerminal: false,
-    // WhatsApp Business rejects/hangs on the "Desktop" identity; a web browser identity links reliably.
+    // WhatsApp Business rejects/hangs on the "Desktop" identity; Chrome browser identity links reliably.
     browser: Browsers.ubuntu("Chrome"),
     syncFullHistory: false,
     generateHighQualityLinkPreview: false,
