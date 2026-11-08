@@ -3,7 +3,8 @@ const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
-  fetchLatestBaileysVersion
+  fetchLatestBaileysVersion,
+  Browsers
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const QRCode = require('qrcode');
@@ -28,7 +29,7 @@ function safeId(rawId) {
   return String(rawId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
 }
 
-// 1. Public Health Check (Render monitors this to know the service is alive)
+// 1. Public Health Check
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
@@ -73,11 +74,20 @@ async function getOrCreateSession(rawId) {
   const entry = existing || { status: 'connecting', qr: null, phone: null, sock: null };
   sessions.set(id, entry);
 
+  // Initialized with WhatsApp Business optimizations
   const sock = makeWASocket({
     version,
     auth: state,
     logger: pino({ level: 'silent' }),
-    printQRInTerminal: false
+    printQRInTerminal: false,
+    // Identifies as standard Desktop browser to avoid WhatsApp Business bot detection
+    browser: Browsers.macOS('Desktop'),
+    // Disables full catalog & message history sync to prevent timeouts on business accounts
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 60000,
+    keepAliveIntervalMs: 25000,
   });
   entry.sock = sock;
 
@@ -225,7 +235,7 @@ app.post('/send/image', async (req, res) => {
   }
 });
 
-// 8. Send files & catalogues (PDF, Word, Excel...) with their real filename and type
+// 8. Send files & catalogues (PDF, Word, Excel...) with real filename and type
 app.post('/send/document', async (req, res) => {
   try {
     const { sessionId, to, filename, caption, base64, mimetype } = req.body || {};
