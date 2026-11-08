@@ -6,16 +6,19 @@
  */
 import express from "express";
 import QRCode from "qrcode";
-import {
-  default as makeWASocket,
-  DisconnectReason,
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  Browsers,
-} from "@whiskeysockets/baileys";
+import * as baileysPkg from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import fs from "node:fs";
 import path from "node:path";
+
+// Baileys CJS/ESM interop helper
+const b = baileysPkg.default && typeof baileysPkg.default === "object" ? baileysPkg.default : baileysPkg;
+const makeWASocket = typeof b.default === "function" ? b.default : (typeof b.makeWASocket === "function" ? b.makeWASocket : baileysPkg.makeWASocket);
+const DisconnectReason = b.DisconnectReason || baileysPkg.DisconnectReason;
+const useMultiFileAuthState = b.useMultiFileAuthState || baileysPkg.useMultiFileAuthState;
+const fetchLatestBaileysVersion = b.fetchLatestBaileysVersion || baileysPkg.fetchLatestBaileysVersion;
+const Browsers = b.Browsers || baileysPkg.Browsers;
+const makeCacheableSignalKeyStore = b.makeCacheableSignalKeyStore || baileysPkg.makeCacheableSignalKeyStore;
 
 const PORT = process.env.PORT || 8081;
 const TOKEN = process.env.BRIDGE_TOKEN;
@@ -46,16 +49,18 @@ async function startSession(rawId) {
   const entry = existing ?? { status: "connecting", qr: null, phone: null };
   sessions.set(id, entry);
 
-  // Desktop Chrome identity + no full history sync links reliably with WhatsApp Business
   const sock = makeWASocket({
     version,
-    auth: state,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore ? makeCacheableSignalKeyStore(state.keys) : state.keys,
+    },
     printQRInTerminal: false,
     browser: Browsers.ubuntu("Chrome"),
     syncFullHistory: false,
     generateHighQualityLinkPreview: false,
     getMessage: async () => undefined,
-    markOnlineOnConnect: false,
+    markOnlineOnConnect: true,
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: 60_000,
     keepAliveIntervalMs: 25_000,
