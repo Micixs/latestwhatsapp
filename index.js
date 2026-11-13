@@ -9,16 +9,20 @@
  */
 import express from "express";
 import QRCode from "qrcode";
-import {
-  default as makeWASocket,
+import * as baileysPackage from "@whiskeysockets/baileys";
+import { Boom } from "@hapi/boom";
+import fs from "node:fs";
+import path from "node:path";
+
+// Unpack Baileys for Node ESM compatibility
+const baileys = baileysPackage.default || baileysPackage;
+const makeWASocket = typeof baileys === "function" ? baileys : (baileys.default || baileysPackage.makeWASocket);
+const {
   DisconnectReason,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   Browsers,
-} from "@whiskeysockets/baileys";
-import { Boom } from "@hapi/boom";
-import fs from "node:fs";
-import path from "node:path";
+} = baileysPackage;
 
 const PORT = process.env.PORT || 8081;
 const TOKEN = process.env.BRIDGE_TOKEN;
@@ -90,7 +94,6 @@ async function startSession(rawId) {
     version,
     auth: state,
     printQRInTerminal: false,
-    // WhatsApp Business rejects/hangs on the "Desktop" identity; a web browser identity links reliably.
     browser: Browsers.ubuntu("Chrome"),
     syncFullHistory: false,
     generateHighQualityLinkPreview: false,
@@ -189,8 +192,6 @@ app.post("/session/start", async (req, res, next) => {
   try {
     const id = safeId(req.body?.sessionId);
     const current = sessions.get(id);
-    // Not linked yet: wipe any half-finished keys so each QR is a clean handshake.
-    // Keep sessions that are finishing a scan or already have saved login keys.
     const credsFile = path.join(DATA_DIR, id, "creds.json");
     let registered = false;
     try {
@@ -214,7 +215,6 @@ app.post("/session/pair", async (req, res, next) => {
     const id = safeId(req.body?.sessionId);
     const current = sessions.get(id);
     if (current?.status === "connected") return res.json({ code: null, status: "connected" });
-    // Fresh, clean session for phone-code pairing: stale keys from a failed QR scan cause "wrong code".
     await resetSession(id);
     const e = await startSession(id);
     if (!e.sock) return res.status(503).json({ error: "Link service is starting, try again" });
@@ -241,7 +241,6 @@ app.post("/session/logout", async (req, res, next) => {
   try {
     const id = safeId(req.body?.sessionId);
     const e = sessions.get(id);
-    // Detach listeners first: the logout "close" event must not wipe or restart a fresh QR session.
     try {
       e?.sock?.ev.removeAllListeners("connection.update");
       e?.sock?.ev.removeAllListeners("creds.update");
@@ -311,3 +310,4 @@ app.use((err, _req, res, _next) => {
 });
 
 app.listen(PORT, () => console.log(`WhatsApp link service listening on :${PORT}`));
+  
